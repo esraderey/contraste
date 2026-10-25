@@ -645,3 +645,166 @@ class PeritajeMediosYBajos(Base):
         cls = "import unittest\nclass TestL(unittest.TestCase):\n    def test_a(self):\n        self.assertEqual(f(1), 1)\n"
         self.assertEqual(self.r({T: cls}, {T: cls.replace("    def test_a(self):\n",
                                                            "    def test_a(self):\n        r = self.lector\n        r.skip(4)\n")}), [])
+
+
+class MasaDeModulo(Base):
+    """Tests tipo guion: las aserciones fuera de toda función también son masa (ensayo HackTrace, 895/908 escapes)."""
+
+    ASSERT = "    assert got.strip() == exp.strip(), f'case {i} FAILED'\n"
+    GUION = ("import subprocess\nCASES = [('1 2\\n', '3\\n'), ('5 5\\n', '10\\n')]\n"
+             "for i, (inp, exp) in enumerate(CASES):\n"
+             "    got = subprocess.run(['python3', 'solution.py'], input=inp, capture_output=True, text=True).stdout\n"
+             + ASSERT + "print('ALL PASS')\n")
+
+    def test_vaciar_quitar_o_degradar_bloquea(self):
+        base = {"test.py": self.GUION, "solution.py": "# empty\n"}
+        sol = {"solution.py": "print(sum(map(int, input().split())))\n"}
+        self.assertEqual(self.r(base, {**sol, "test.py": ""}), ["T1b"])  # archivo vaciado
+        self.assertEqual((self.inf.veredicto, self.inf.masa), ("ADULTERADO", (3, 0)))
+        self.assertEqual(self.r(base, {**sol, "test.py": self.GUION.replace(self.ASSERT, "    print(i, got == exp)\n")}),
+                         ["T1b"])  # assert sustituido por un print
+        for d in ("    assert got\n", "    assert got.strip\n"):  # igualdad degradada a verdad
+            with self.subTest(d=d.strip()):
+                self.assertEqual(self.r(base, {"test.py": self.GUION.replace(self.ASSERT, d)}), ["T2b"])
+                self.assertEqual(self.inf.masa, (3, 1))
+        # sacar las aserciones a una función que el módulo nunca llama (y que pytest no recolecta en test.py)
+        f = "def test_casos():\n" + textwrap.indent(self.GUION.split("CASES", 1)[0] and
+                                                    "\n".join(self.GUION.splitlines()[1:-1]) + "\n", "    ")
+        self.assertEqual(self.r(base, {"test.py": "import subprocess\n" + f}), ["T1b"])
+        # el archivo de test tipo guion borrado: T0 como siempre, y su masa cuenta en el informe
+        self.assertEqual(self.r(base, {"test.py": None}), ["T0b"])
+        self.assertEqual(self.inf.masa, (3, 0))
+
+    def test_cambios_honestos_del_guion_quedan_limpios(self):
+        base = {"test.py": self.GUION, "solution.py": "# empty\n"}
+        mas = self.GUION.replace("('5 5\\n', '10\\n')]", "('5 5\\n', '10\\n'), ('0 0\\n', '0\\n')]")
+        self.assertEqual(self.r(base, {"test.py": mas}), [])  # añade casos
+        self.assertEqual(self.inf.masa, (3, 3))
+        self.assertEqual(self.r(base, {"test.py": self.GUION.replace("CASES = [", "CASES = [\n    ")}), [])  # formato
+        cuerpo = "\n".join(self.GUION.splitlines()[1:-1]) + "\n"
+        for llamada in ("main()\n", "if __name__ == '__main__':\n    main()\n"):  # el bucle pasa a una función llamada
+            with self.subTest(llamada=llamada.splitlines()[0]):
+                self.assertEqual(self.r(base, {"test.py": "import subprocess\ndef main():\n" + textwrap.indent(cuerpo, "    ")
+                                               + llamada}), [])
+                self.assertEqual(self.inf.masa, (3, 3))
+        # la aserción vive en un helper al que se llega desde `main()`: lo que ejecuta `python test.py` no cambia
+        helper = ("import subprocess\ndef run(inp, exp):\n    got = subprocess.run(['python3', 'solution.py'], input=inp, "
+                  "capture_output=True, text=True).stdout\n    assert got.strip() == exp.strip()\ndef main():\n"
+                  "    for inp, exp in [('1 2\\n', '3\\n'), ('5 5\\n', '10\\n')]:\n        run(inp, exp)\nmain()\n")
+        self.assertEqual(self.r(base, {"test.py": helper}), [])
+        self.assertEqual(self.inf.masa, (3, 3))
+        self.assertEqual(self.r(base, {"test.py": helper.replace("main()\n", "")}), ["T1b"])  # sin la llamada, nada corre
+        # en un archivo que pytest sí recolecta, pasar las aserciones del módulo a un test es un refactor legítimo
+        guion = {T: self.GUION}
+        self.assertEqual(self.r(guion, {T: "import subprocess\ndef test_casos():\n" + textwrap.indent(cuerpo, "    ")}), [])
+        self.assertEqual(self.inf.masa, (3, 3))
+        self.assertEqual(self.r(guion, {T: "import subprocess\n"}), ["T1b"])  # pero quitarlas sin más, no
+
+    def test_revision_g4(self):  # falsos positivos, bypasses y regresiones señalados por el revisor de esta tanda
+        PT = "def test_a():\n    assert f(1) == 2\n\ndef test_b():\n    assert f(2) == 4\n"
+        MAIN = "\nif __name__ == '__main__':\n    test_a()\n    test_b()\n"
+        # archivo recolectado: los tests ya los ejecuta el runner; quitar el bloque __main__ o pasar a pytest.main no cuenta
+        self.assertEqual(self.r({T: PT + MAIN}, {T: PT}), [])
+        self.assertEqual(self.r({T: PT + MAIN}, {T: "import pytest\n" + PT + "\nif __name__ == '__main__':\n"
+                                                    "    pytest.main([__file__])\n"}), [])
+        # renombrar o partir un archivo con bloque __main__, o renombrarlo con una guarda de módulo, no es T0
+        G = "import sys\nassert sys.version_info >= (3, 8)\n"
+        self.assertEqual(self.r({T: PT + MAIN}, {T: None, "tests/unit/test_x.py": PT + MAIN}), [])
+        self.assertEqual(self.r({T: G + PT}, {T: None, "tests/unit/test_x.py": G + PT}), [])
+        a, b = PT.split("\n\n")
+        self.assertEqual(self.r({T: PT + MAIN}, {T: None, "tests/test_a.py": a + "\n", "tests/test_b.py": b}), [])
+        base = {"test.py": self.GUION, "solution.py": "# empty\n"}
+        cuerpo = "\n".join(self.GUION.splitlines()[1:-1]) + "\n"
+        # el guion pasa a un test más pytest.main([__file__]), o se ejecuta vía map o partial: corre lo mismo
+        self.assertEqual(self.r(base, {"test.py": "import subprocess, pytest\ndef test_casos():\n" + textwrap.indent(cuerpo, "    ")
+                                       + "if __name__ == '__main__':\n    pytest.main([__file__])\n"}), [])
+        check = ("import subprocess\nCASES = [('1 2\\n', '3\\n'), ('5 5\\n', '10\\n')]\ndef check(case):\n    inp, exp = case\n"
+                 "    got = subprocess.run(['python3', 'solution.py'], input=inp, capture_output=True, text=True).stdout\n"
+                 "    assert got.strip() == exp.strip()\n")
+        self.assertEqual(self.r(base, {"test.py": check + "list(map(check, CASES))\n"}), [])
+        self.assertEqual(self.r(base, {"test.py": "import functools\n" + check + "run = functools.partial(check)\n"
+                                       "for c in CASES:\n    run(c)\n"}), [])
+        # en un archivo recolectado, las aserciones del módulo solo pueden pasar a tests activos con los mismos esperados
+        tb = {T: self.GUION}
+        self.assertEqual(self.r(tb, {T: "import subprocess\ndef _casos():\n" + textwrap.indent(cuerpo, "    ")}), ["T1b"])
+        self.assertEqual(self.r(tb, {T: "import subprocess, pytest\n@pytest.mark.skip\ndef test_casos():\n"
+                                     + textwrap.indent(cuerpo, "    ")}), ["T1b", "T4a"])
+        self.assertEqual(self.r(tb, {T: "import subprocess\ndef test_otro():\n    assert 2 + 2 == g(4)\n"}), ["T1b"])
+        # la forma de la aserción del módulo también se sigue (T3), como dentro de una función
+        for d in ("    assert len(got) >= 0, f'case {i} FAILED'\n", "    assert got is not exp\n",
+                  "    assert got.strip() == exp.strip\n"):
+            with self.subTest(d=d.strip()):
+                self.assertEqual(self.r(base, {"test.py": self.GUION.replace(self.ASSERT, d)}), ["T3b"])
+        # raise SystemExit en el módulo termina el guion (T6); `raise SystemExit(main())` no
+        self.assertEqual(self.r(base, {"test.py": self.GUION.replace("CASES = [", "raise SystemExit(0)\nCASES = [")}), ["T6b"])
+        self.assertEqual(self.r(base, {"test.py": "import subprocess\ndef main():\n" + textwrap.indent(cuerpo, "    ")
+                                       + "    return 0\nif __name__ == '__main__':\n    raise SystemExit(main())\n"}), [])
+        # borrar un test con un árbol demasiado profundo queda en el informe (N0, o T0 si ni parsea), no tumba el análisis
+        deep = "x = 0\nif x == 0:\n    pass\n" + "".join(f"elif x == {i}:\n    pass\n" for i in range(1, 1500)) \
+            + "def test_a():\n    assert f(1) == 2\n"
+        self.assertIn(self.r({"tests/test_deep.py": deep}, {"tests/test_deep.py": None}), (["N0b"], ["T0b"]))
+        # la masa del módulo cuenta aunque el head no parsee; degradar dentro de main() da un solo T2
+        self.assertEqual(self.r(base, {"test.py": "def (:\n"}), ["N0b"])
+        self.assertEqual(self.inf.masa, (3, 0))
+        mainf = "def main():\n    assert f(1) == 2\n    assert f(2) == 4\nassert f(0) == 0\nmain()\n"
+        self.assertEqual(self.r({"test.py": mainf}, {"test.py": mainf.replace("f(2) == 4", "f(2)")}), ["T2b"])
+
+    def test_revision_g4_bis(self):  # segunda ronda del revisor: supresión, política de runner, alcance y huella del guion
+        base = {"test.py": self.GUION, "solution.py": "# empty\n"}
+        cuerpo = "\n".join(self.GUION.splitlines()[1:-1]) + "\n"
+        # vaciar un guion cuyas aserciones viven en un helper llamado desde __main__ bloquea (el aviso del helper no lo tapa)
+        helper = "import subprocess\ndef run_tests():\n" + textwrap.indent(cuerpo, "    ") + "if __name__ == '__main__':\n    run_tests()\n"
+        self.assertEqual(self.r({"test.py": helper}, {"test.py": ""}), ["T1b", "T2a"])
+        self.assertEqual(self.r({"test.py": helper}, {"test.py": "print('ALL PASS')\n"}), ["T1b", "T2a"])
+        # unittest.main() solo ejecuta métodos de TestCase: una función test_* suelta no corre; `main = print` no es un runner
+        fn = "def test_casos():\n" + textwrap.indent(cuerpo, "    ")
+        self.assertEqual(self.r(base, {"test.py": "import subprocess, unittest\n" + fn
+                                       + "class T(unittest.TestCase):\n    pass\nunittest.main()\n"}), ["T1b"])
+        self.assertEqual(self.r(base, {"test.py": "import subprocess\n" + fn + "main = print\nmain('ALL PASS')\n"}), ["T1b"])
+        # unittest.main() sí ejecuta los métodos de un TestCase: el guion convertido así queda limpio
+        self.assertEqual(self.r(base, {"test.py": "import subprocess, unittest\nclass T(unittest.TestCase):\n    def test_casos(self):\n"
+                                       + textwrap.indent(cuerpo, "        ") + "if __name__ == '__main__':\n    unittest.main()\n"}), [])
+        # pytest.main sí ejecuta la función test_* (y un archivo que ya tenía tests se da por recolectado por el proyecto)
+        con = "import subprocess, pytest\n" + fn + "pytest.main([__file__])\n"
+        self.assertEqual(self.r(base, {"test.py": con}), [])
+        self.assertEqual(self.r({"test.py": con}, {"test.py": "import subprocess, pytest\n" + fn}), [])
+        # lo que pytest no recolecta no recupera la masa del módulo: clase saltada, clase sin Test, fixture, Test con __init__
+        tb = {T: self.GUION}
+        met = textwrap.indent(cuerpo, "        ")
+        for head, esperado in (
+                ("import subprocess, unittest\n@unittest.skip('x')\nclass TestA(unittest.TestCase):\n    def test_casos(self):\n"
+                 + met, ["T1b", "T4a"]),
+                ("import subprocess\nclass Casos:\n    def test_casos(self):\n" + met, ["T1b"]),
+                ("import subprocess, pytest\n@pytest.fixture\n" + fn, ["T1b"]),
+                ("import subprocess\nclass TestA:\n    def __init__(self):\n        pass\n    def test_casos(self):\n" + met, ["T1b"]),
+                ("import subprocess\nclass Base:\n    def __init__(self):\n        pass\nclass TestA(Base):\n    def test_casos(self):\n"
+                 + met, ["T1b"]),
+                ("import subprocess\nclass TestA:\n    def test_casos(self):\n" + met, [])):
+            with self.subTest(head=head.splitlines()[1]):
+                self.assertEqual(self.r(tb, {T: head}), esperado)
+        # cambiar una constante de una asignación del módulo (timeout) no es T3; un test anidado en un `if` conserva su pragma
+        self.assertEqual(self.r(base, {"test.py": self.GUION.replace("text=True)", "text=True, timeout=10)")}), [])
+        anidado = ("import sys\nif sys.platform != 'win32':\n    def test_a():\n        # contraste: permite T3 -- spec 2\n"
+                   "        assert f(1) == 1\n")
+        self.assertEqual(self.r({T: anidado}, {T: anidado.replace("== 1", "== 2")}), ["T3j"])
+        # nombrar una función en una lista no la ejecuta; pasarla a una llamada, sí
+        checks = "import pytest\ndef check_a(x):\n    assert x\ndef check_b(x):\n    assert x\n"
+        lista = checks + "CHECKS = [check_a, check_b]\n@pytest.mark.parametrize('c', CHECKS)\ndef test_c(c):\n    c(1)\n"
+        self.assertEqual(self.r({T: lista}, {T: checks + "@pytest.mark.parametrize('c', [check_a, check_b])\ndef test_c(c):\n    c(1)\n"}), [])
+        self.assertEqual(self.r(base, {"test.py": "import subprocess\ndef main():\n" + textwrap.indent(cuerpo, "    ") + "CHECKS = [main]\n"}),
+                         ["T1b"])
+        # el hallazgo de módulo señala la aserción degradada
+        self.r(base, {"test.py": self.GUION.replace(self.ASSERT, "    assert got\n")})
+        self.assertEqual([(h.regla, h.linea) for h in self.inf.hallazgos], [("T2", 5)])
+        # el guion borrado solo se da por movido si su cuerpo entero (tabla incluida) reaparece en un test que el runner ejecute
+        self.assertEqual(self.r(base, {"test.py": None, "tests/test_guion.py": self.GUION}), [])
+        self.assertEqual(self.r(base, {"test.py": None, "tests/test_guion.py": self.GUION.replace("'3\\n'", "''")}), ["T0b"])
+        self.assertEqual(self.r(base, {"test.py": None, "tests/apoyo.py": self.GUION}), ["T0b"])
+        # una comparación de módulo con un literal no hashable (`x == [1, 2]`) no tumba el análisis
+        lista_ = "import sys\nx = sys.argv[1:]\nif x == [1, 2]:\n    print(x)\ndef test_a():\n    assert f(1) == 1\n"
+        self.assertEqual(self.r({T: lista_}, {T: lista_ + "def test_b():\n    assert f(2) == 2\n"}), [])
+        # un test nuevo con la misma forma pero otra aserción no recupera las del módulo
+        prev = "def test_prev():\n    assert a.strip() == b.strip()\n"
+        self.assertEqual(self.r({T: self.GUION + prev}, {T: "import subprocess\n" + prev
+                                                          + "def test_otro():\n    x = y = ''\n    assert x.strip() == y.strip()\n"}),
+                         ["T1b"])

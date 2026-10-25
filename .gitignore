@@ -1,3 +1,19 @@
+# Uso interno: auditorías (peritaje), evidencia de forja, revisiones G4 y PoC. Se queda fuera del repo.
 peritaje/
 .forja/
+revision*/
+poc*/
+*.log
+
+# Python
 __pycache__/
+*.pyc
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+
+# Herramientas locales
+.claude/
+.venv/
+venv/

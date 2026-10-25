@@ -301,6 +301,12 @@ def _fuera(ruta: str) -> bool:
                for c in ruta.split("/")[:-1])
 
 
+def _recolectable(ruta: str, ta) -> bool:
+    """¿Corre el runner los tests de esta ruta? Por nombre, o porque en la base ya tenía tests (los recoge el proyecto)."""
+    return _rec_arch(ruta) or (ta is not None and not _fuera(ruta)
+                               and any(qn.rsplit(".", 1)[-1].startswith("test_") for qn in _funciones(ta)))
+
+
 _NO = object()
 _FN = (ast.FunctionDef, ast.AsyncFunctionDef)
 _AMBITO = (*_FN, ast.ClassDef, ast.Lambda)
@@ -572,6 +578,137 @@ def masa(f, extra=()) -> int:
     return total * _filas(f, extra)
 
 
+def _es_test(qn: str) -> bool:
+    return qn.rsplit(".", 1)[-1].startswith("test")
+
+
+def _corre_runner(t):
+    """Runner que invoca el módulo: "pytest" (`pytest.main(…)`), "unittest" (`unittest.main()`, que solo ejecuta métodos
+    de *TestCase) o None."""
+    llamadas = {_punteado(n.func) for n in (_propios(t) if t is not None else ()) if isinstance(n, ast.Call)}
+    return "pytest" if "pytest.main" in llamadas else "unittest" if "unittest.main" in llamadas else None
+
+
+def _activos(t, runner) -> dict:
+    """qualname → test que el runner ejecuta: con pytest, funciones `test*` y métodos de clases `Test*` sin `__init__` o
+    *TestCase; con unittest, solo métodos de *TestCase. Ni fixtures ni tests saltados."""
+    if t is None or runner is None:
+        return {}
+    clases, casos, out = {c.name: c for c in ast.walk(t) if isinstance(c, ast.ClassDef)}, _subclases_testcase(t), {}
+
+    def con_init(c) -> bool:  # `__init__` propio o heredado de una clase del mismo módulo: pytest no la recolecta
+        pila, vistas = [c], set()
+        while pila:
+            k = pila.pop()
+            if k.name not in vistas:
+                vistas.add(k.name)
+                if any(isinstance(s, _FN) and s.name == "__init__" for s in k.body):
+                    return True
+                pila += [clases[b] for b in map(_nombre, k.bases) if b in clases]
+        return False
+
+    for qn, f in _funciones(t).items():
+        clase = clases.get(qn.rsplit(".", 2)[-2]) if "." in qn else None
+        if not _es_test(qn) or any(_punteado(d.func if isinstance(d, ast.Call) else d).endswith("fixture")
+                                  for d in f.decorator_list):
+            continue
+        ok = runner == "pytest" if clase is None else clase.name in casos or (
+            runner == "pytest" and clase.name.startswith("Test") and not con_init(clase))
+        if ok and not _desactivado(f, clase.decorator_list if clase else ()):
+            out[qn] = f
+    return out
+
+
+def _es_main(s) -> bool:
+    """`if __name__ == "__main__":`, el bloque que el runner nunca ejecuta."""
+    return isinstance(s, ast.If) and isinstance(s.test, ast.Compare) and len(s.test.ops) == 1 \
+        and isinstance(s.test.ops[0], ast.Eq) and any(_punteado(x) == "__name__" and _lit(y) == "__main__" for x, y in (
+            (s.test.left, s.test.comparators[0]), (s.test.comparators[0], s.test.left)))
+
+
+def _sentencias(t, runner) -> list:
+    """Sentencias del módulo que se ejecutan al correrlo; con `runner`, sin el bloque `__main__`."""
+    return [s for s in t.body if not (runner and _es_main(s))]
+
+
+def _nodos_modulo(t, runner) -> list:
+    """Nodos del cuerpo del módulo, sin entrar en funciones ni clases."""
+    return [n for s in _sentencias(t, runner) if not isinstance(s, _AMBITO) for n in (s, *_propios(s))]
+
+
+class _SinDefs(ast.NodeTransformer):
+    """Quita las funciones y clases anidadas: lo que queda es lo que el módulo ejecuta directamente."""
+
+    def visit_FunctionDef(self, n):
+        return None
+
+    visit_AsyncFunctionDef = visit_ClassDef = visit_FunctionDef
+
+
+def _cuerpo_modulo(t, runner=None, asignaciones: bool = False):
+    """El cuerpo del módulo como pseudofunción: sus sentencias sin definiciones (a ninguna profundidad) ni, salvo
+    `asignaciones`, asignaciones de primer nivel."""
+    pm, cuerpo = ast.parse("def _modulo(): pass").body[0], []
+    for s in _sentencias(t, runner):
+        if isinstance(s, (*_FN, ast.ClassDef)) or (not asignaciones and isinstance(s, (ast.Assign, ast.AnnAssign, ast.AugAssign))):
+            continue
+        if any(isinstance(m, (*_FN, ast.ClassDef)) for m in ast.walk(s)):
+            s = _SinDefs().visit(copy.deepcopy(s))
+        if s is not None:
+            cuerpo.append(s)
+    pm.body = cuerpo or pm.body
+    return pm
+
+
+def _llamadas(nodos):
+    """Nombres en posición de llamada o pasados a una llamada (`main()`, `map(check, …)`): lo que se ejecuta."""
+    for c in nodos:
+        if isinstance(c, ast.Call):
+            for x in (c.func, *c.args, *(k.value for k in c.keywords)):
+                if isinstance(x, ast.Name):
+                    yield x.id
+
+
+def _alcance(t, runner=None) -> list:
+    """Funciones del módulo que el módulo ejecuta: las que llama o pasa a una llamada, y las que estas llaman
+    (`main()` → `run()` → assert). Con pytest, las funciones `test*` quedan fuera: ya las ejecuta el runner."""
+    fs = {qn: f for qn, f in _funciones(t).items() if "." not in qn and not (runner == "pytest" and _es_test(qn))}
+    pila, vistas, orden = list(_llamadas(_nodos_modulo(t, runner))), set(), []
+    while pila:
+        q = pila.pop()
+        if q in fs and q not in vistas:
+            vistas.add(q)
+            orden.append(fs[q])
+            pila += list(_llamadas(ast.walk(fs[q])))
+    return orden
+
+
+def _masa_modulo(t, runner=None, alcance=None, propia: bool = False) -> int:
+    """Masa del cuerpo del módulo (tests tipo guion): aserciones fuera de toda función y, salvo `propia`, las de las
+    funciones que el módulo ejecuta (lo que corre `python test.py`, o el runner si él lo ejecuta)."""
+    nodos = [n for n in _nodos_modulo(t, runner) if isinstance(n, (ast.Assert, ast.Call))]
+    total = sum(_peso_test(n.test) if isinstance(n, ast.Assert) else _peso_llamada(n) for n in nodos)
+    return total if propia else total + sum(map(masa, _alcance(t, runner) if alcance is None else alcance))
+
+
+def _aserciones(nodos) -> list:
+    """La expresión (sin el mensaje) de cada assert."""
+    return [ast.dump(n.test) for n in nodos if isinstance(n, ast.Assert)]
+
+
+def _aserciones_modulo(t, runner, alcance) -> list:
+    """Las aserciones que ejecuta el módulo: las suyas y las de las funciones a su alcance."""
+    return _aserciones(_nodos_modulo(t, runner)) + [d for f in alcance for d in _aserciones(ast.walk(f))]
+
+
+def _esperados_modulo(t, runner, alcance) -> Counter:
+    """Lo que fijan las aserciones que ejecuta el módulo (las suyas y las de las funciones a su alcance)."""
+    out = Counter(_esperados(_cuerpo_modulo(t, runner), asignaciones=False))
+    for f in alcance:
+        out.update(_esperados(f))
+    return out
+
+
 def _entornos(f) -> list:
     """Ligaduras nombre→valor por fila de parametrize (producto acotado)."""
     envs = [{}]
@@ -729,8 +866,9 @@ def _comparaciones(t):
             yield from _comparaciones(v)
 
 
-def _esperados(f, extra=()) -> list:
-    """Lo que fija un test: literales y operadores de sus aserciones, filas, raises/approx y la forma de cada comparación."""
+def _esperados(f, extra=(), asignaciones: bool = True) -> list:
+    """Lo que fija un test: literales y operadores de sus aserciones, filas, raises/approx y la forma de cada comparación
+    (y, salvo que `asignaciones` sea falso, los literales de sus asignaciones)."""
     en = _entornos_env(f)
     out = [_u(fila, 120) for _, filas in _parametrize(f, extra) for fila in (filas or [])]
     for n in ast.walk(f):
@@ -738,7 +876,7 @@ def _esperados(f, extra=()) -> list:
         if nom in ("raises", "warns", "approx", "assertRaises", "assertAlmostEqual"):
             out.append(_u_canon(n))
         out += [nom] * nom.startswith("assert")
-        nodos = [n.test] if isinstance(n, ast.Assert) else [n.value] if isinstance(n, ast.Assign) else [
+        nodos = [n.test] if isinstance(n, ast.Assert) else [n.value] if isinstance(n, ast.Assign) and asignaciones else [
             *n.args[:2], *(k.value for k in n.keywords if k.arg != "msg")] if nom.lower().startswith("assert") else []
         out += [f"op:{o}" for x in nodos for m in ast.walk(x) if isinstance(m, ast.Compare) for o in _ops(m, env)]
         out += [_r(v) for x in nodos for m in ast.walk(x)
@@ -937,9 +1075,14 @@ def _reglas_test(ruta, a, b, add, H, movidos, conservados, base) -> tuple:
     """Reglas T1–T7 de un archivo de tests; devuelve (masa base, masa head)."""
     ta, tb = _parse(a), _parse(b)
     fa, fb = (_funciones(ta) if ta else {}), (_funciones(tb) if tb else {})
+    runner = "pytest" if _recolectable(ruta, ta) else _corre_runner(tb)  # quién ejecuta los tests del archivo
+    alc_a, alc_b = (_alcance(ta, runner) if ta else []), (_alcance(tb, runner) if tb else [])
+    ma0 = _masa_modulo(ta, runner, alc_a) if ta else 0
+    propia_a = _masa_modulo(ta, runner, propia=True) if ta else 0
     if tb is None:
         H.append(Hallazgo("N0", BLOQUEA, ruta, 1, f"{ruta} no parsea con este Python: no se puede certificar"))
-        return sum(map(masa, fa.values())), 0
+        return sum(map(masa, fa.values())) + propia_a, 0
+    mb0, antes = _masa_modulo(tb, runner, alc_b), len(H)
     for qn, f in fa.items():
         g = fb.get(qn)
         if g is None:
@@ -954,6 +1097,22 @@ def _reglas_test(ruta, a, b, add, H, movidos, conservados, base) -> tuple:
             fuera, dentro = (", ".join(e if len(e) <= 80 else e[:79] + "…" for e in list(x.elements())[:3]) or "∅"
                              for x in (ea - eb, eb - ea))
             H.append(Hallazgo("T3", BLOQUEA, ruta, g.lineno, f"{qn}: esperados {fuera} → {dentro}", _tramo(g)))
+    asr = [n.lineno for n in _propios(tb) if isinstance(n, ast.Assert)]
+    ln0 = min([x for x in asr if x in add] or asr or [1])
+    if mb0 < ma0:  # el módulo ejecuta menos aserciones; vale si esas mismas aserciones pasan a tests activos del runner
+        act_a, act_b = _activos(ta, runner), _activos(tb, runner)
+        recuperada = bool(runner) and sum(map(masa, act_b.values())) - sum(map(masa, act_a.values())) >= ma0 - mb0 and set(
+            _aserciones_modulo(ta, runner, alc_a)) <= {d for g in act_b.values() for d in _aserciones(ast.walk(g))}
+        caidas = any(h.regla in ("T1", "T2") and h.sev == BLOQUEA for h in H[antes:])  # una función caída ya lo explica
+        if not recuperada and (_masa_modulo(tb, runner, propia=True) < propia_a or not caidas):
+            H.append(Hallazgo("T1", BLOQUEA, ruta, ln0, f"módulo: desaparecen sus aserciones (masa {ma0} → 0)") if mb0 == 0
+                     else Hallazgo("T2", BLOQUEA, ruta, ln0, f"módulo: masa de aserción {ma0} → {mb0}"))
+    elif ta is not None:
+        ea, eb = _esperados_modulo(ta, runner, alc_a), _esperados_modulo(tb, runner, alc_b)
+        if ea - eb:
+            fuera, dentro = (", ".join(e if len(e) <= 80 else e[:79] + "…" for e in list(x.elements())[:3]) or "∅"
+                             for x in (ea - eb, eb - ea))
+            H.append(Hallazgo("T3", BLOQUEA, ruta, ln0, f"módulo: esperados {fuera} → {dentro}"))
     tab_a, tab_b = (_tablas(ta) if ta else {}), _tablas(tb)
     for k in sorted(k for k in tab_a.keys() & tab_b.keys() if tab_a[k][0] - tab_b[k][0]):
         H.append(Hallazgo("T3", BLOQUEA, ruta, tab_b[k][1], f"cambia la tabla de casos {k}"))
@@ -1075,9 +1234,11 @@ def _reglas_test(ruta, a, b, add, H, movidos, conservados, base) -> tuple:
                 n.exc.func if isinstance(n.exc, ast.Call) else n.exc)) == "SkipTest":
             H.append(Hallazgo("T4", sev4, ruta, ln, "raise SkipTest desactiva el test"))
         elif isinstance(n, ast.Raise) and n.exc is not None and exc in _FATALES and exc != "BaseException" \
-                and f is not None and id(f) not in anidadas and id(n) not in protegidos and (
-                f.name.startswith("test") or f.name in _CICLO or any(  # un helper suelto suele simular la salida bajo assertRaises
-                    _punteado(d.func if isinstance(d, ast.Call) else d).endswith("fixture") for d in f.decorator_list)):
+                and id(n) not in protegidos and ((f is None and not (isinstance(n.exc, ast.Call) and any(  # en el módulo, salvo
+                    isinstance(x, ast.Call) and _nombre(x.func) == "main" for x in n.exc.args))) or (  # `raise SystemExit(main())`
+                f is not None and id(f) not in anidadas and (
+                    f.name.startswith("test") or f.name in _CICLO or any(  # un helper suelto suele simular la salida bajo assertRaises
+                        _punteado(d.func if isinstance(d, ast.Call) else d).endswith("fixture") for d in f.decorator_list)))):
             H.append(Hallazgo("T6", BLOQUEA, ruta, ln, f"raise {exc} termina el proceso de tests"))
         elif isinstance(n, ast.Return) and f is not None and f.name.startswith("test") and retorno_prematuro(f, n):
             H.append(Hallazgo("T5", BLOQUEA, ruta, ln, f"return en {f.name} antes de sus aserciones"))
@@ -1096,7 +1257,7 @@ def _reglas_test(ruta, a, b, add, H, movidos, conservados, base) -> tuple:
                     H.append(Hallazgo("T7", BLOQUEA, ruta, ln, f"{pt} cambia la recolección o carga plugins"))
                 elif "." in pt and pt.split(".")[0] in _ARNES and pt.rsplit(".", 1)[-1] not in _CONFIG_TC:
                     H.append(Hallazgo("O2", BLOQUEA, ruta, ln, f"reasigna {pt}"))
-    return sum(map(masa, fa.values())), sum(map(masa, fb.values()))
+    return sum(map(masa, fa.values())) + propia_a, sum(map(masa, fb.values())) + _masa_modulo(tb, runner, propia=True)
 
 
 _CMP = {"__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__", "__contains__", "__instancecheck__",
@@ -1434,14 +1595,21 @@ def analizar(par, confiar_pragmas: bool = False) -> Informe:
     tb = {k: _texto(v, k.endswith(".py")) for k, v in par.leer("base", [c[1] for c in cambios if c[1]]).items()}
     th = {k: _texto(v, k.endswith(".py")) for k, v in par.leer("head", [c[2] for c in cambios if c[2]]).items()}
     H, adds, textos, bases, pruebas, fuentes, borrados, umbrales, sin_runner, ma, mb = [], {}, {}, {}, [], [], [], {}, {}, 0, 0
+    guiones = []  # archivos de test borrados cuyo módulo ejecutaba aserciones: (ruta, huella del cuerpo del módulo)
     for _, rb, rh in cambios:
         ka, kb = (tipo(rb) if rb else None), (tipo(rh) if rh else None)
         if rh is None:
             textos[rb] = bases[rb] = tb.get(rb)
             arbol = _parse(tb.get(rb)) if ka == "pytest" else None
             if arbol:
-                ma += _seguro(H, rb, 0, lambda t: sum(map(masa, _funciones(t).values())), arbol)
+                mf, mm, hm = _seguro(H, rb, (0, 0, None), lambda t: (
+                    sum(map(masa, _funciones(t).values())) + _masa_modulo(t, propia=True),
+                    _masa_modulo(t, "pytest" if _recolectable(rb, t) else _corre_runner(t)),
+                    _huella(_cuerpo_modulo(t, asignaciones=True))), arbol)
+                ma += mf
                 borrados.append((rb, arbol))
+                if mm and ka == "pytest":
+                    guiones.append((rb, hm))
             if not arbol and ka == "pytest" or rb.endswith("conftest.py"):
                 H.append(Hallazgo("T0", BLOQUEA, rb, 1, f"{rb} eliminado"))
             if ka in ("config", "mixto") and tb.get(rb):  # borrar la configuración entera es quitar todas sus líneas
@@ -1465,6 +1633,10 @@ def analizar(par, confiar_pragmas: bool = False) -> Informe:
             fuentes.append((rh, a, b, add))
         elif kb in ("config", "mixto"):
             _reglas_config(rh, kb, a or "", b, add, rem, H, umbrales, sin_runner)
+    if guiones:  # un guion borrado no se sigue función a función: cuenta, salvo que su cuerpo entero reaparezca en un
+        cuerpos = {_seguro(H, rh, None, lambda t: _huella(_cuerpo_modulo(t, asignaciones=True)), t)  # test que el runner ejecute
+                   for rh, _, a, b, _ in pruebas if (t := _parse(b)) and (_recolectable(rh, _parse(a)) or _corre_runner(t))}
+        H += [Hallazgo("T0", BLOQUEA, rb, 1, f"{rb} eliminado") for rb, hm in guiones if hm not in cuerpos]
     if umbrales or sin_runner:  # decisiones que dependen del resto de la configuración del head, tocada o no
         tocada = {q: textos[q] for q in adds if tipo(q) in ("config", "mixto")}
         quieta = {q: t for q, v in par.leer("head", [r for r in par.listar("head") if r not in tocada
@@ -1485,10 +1657,7 @@ def analizar(par, confiar_pragmas: bool = False) -> Informe:
     for rh, _, a, b, _ in pruebas:
         for t, lado in ((_parse(b), "head"), (_parse(a), "base")):
             if t is not None and lado == "head":
-                ta_ = _parse(a)  # un destino que ya tenía tests en la base lo recolecta el runner del proyecto
-                tenia = ta_ is not None and not _fuera(rh) and any(
-                    qn.rsplit(".", 1)[-1].startswith("test_") for qn in _funciones(ta_))
-                for k, vs in _seguro(H, rh, {}, _indice, t, rh, _rec_arch(rh) or tenia).items():
+                for k, vs in _seguro(H, rh, {}, _indice, t, rh, _recolectable(rh, _parse(a))).items():
                     movidos.setdefault(k, []).extend(vs)
                     for v in vs:  # pares que se siguen probando, con el test que los prueba
                         for x in (v[3] if v[2] else ()):

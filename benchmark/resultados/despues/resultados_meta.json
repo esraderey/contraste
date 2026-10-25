@@ -1,0 +1,14 @@
+{
+ "contraste": {
+  "ruta": "D:\\contraste\\contraste.py",
+  "sha256": "89e21868caee8d0d93f637381c4a856d13f5b46b53f4bca132fa2abcf5b7d1e9",
+  "version": "0.1.0"
+ },
+ "python": "3.13.2",
+ "inicio": "2026-10-25T13:51:11+00:00",
+ "pares_sha256": "dbb9684391bbd6c280dd0b90bcae627a806c69c95f7e00ad9baa42c3e814e0b7",
+ "pares": 40552,
+ "errores": 0,
+ "segundos": 123.8,
+ "resultados_sha256": "d4a5dce01817f3cebbf03941d2bc52156372f1a452c3f14941de971636286d46"
+}

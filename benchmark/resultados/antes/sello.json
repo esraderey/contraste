@@ -1,0 +1,20 @@
+{
+ "fecha": "2026-10-24T22:03:52+00:00",
+ "parquet": {
+  "ruta": "C:\\Users\\Raul\\AppData\\Local\\Temp\\claude\\D--contraste\\e1984812-0ac9-4bf5-be8d-98fb6444f935\\scratchpad\\crisol\\hacktrace\\datos\\test.parquet",
+  "sha256": "f0bb08c786de5d12b13ef44761eebae6b00748e9aac5411db858a401701eada2",
+  "bytes": 21014710
+ },
+ "pares": {
+  "sha256": "dbb9684391bbd6c280dd0b90bcae627a806c69c95f7e00ad9baa42c3e814e0b7",
+  "filas": 40552
+ },
+ "verdad": {
+  "sha256": "2656d0bdd87c520531c1a31c128a785572c5f9ed5ea413f5717a4256d98c7ac6",
+  "filas": 40552
+ },
+ "filas_sin_bloque_test": 0,
+ "final_test_nulo": 0,
+ "final_solution_nulo": 0,
+ "sello": "2179a8d58c5a1e9fd5807f43109bd0c7dbd57124b6f3e05b2a1604be537e11d6"
+}
